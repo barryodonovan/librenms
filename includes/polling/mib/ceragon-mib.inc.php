@@ -1,4 +1,8 @@
 <?php
+
+$num_radios = explode(' ', $device[features])[0];
+
+
 $mib_oids = array();
 
 $radioNumber = 0;
@@ -35,12 +39,14 @@ if (stristr($IfDescr, "Radio")) {
             $IfName." MSE",
             "GAUGE",
         );
-    $mib_oids["genEquipRadioStatusXPI.$IfIndex"] = array(
-            "",
-            "radio".$radioNumber."XPI",
-            $IfName." Cross Polarisation Interference",
-            "GAUGE",
-        );
+    if ($num_radios > 1) {
+        $mib_oids["genEquipRadioStatusXPI.$IfIndex"] = array(
+                "",
+                "radio".$radioNumber."XPI",
+                $IfName." Cross Polarisation Interference",
+                "GAUGE",
+            );
+    }
     $mib_oids["genEquipRadioStatusDefectedBlocks.$IfIndex"] = array(
             "",
             "radio".$radioNumber."DefectedBlocks",
@@ -61,6 +67,7 @@ if (stristr($IfDescr, "Radio")) {
         );
 }
 }
+if ($num_radios > 1) {
     $mib_graphs = array(
         "ceragon_RxLevel",
         "ceragon_TxPower",
@@ -70,7 +77,16 @@ if (stristr($IfDescr, "Radio")) {
         "ceragon_TxBitrate",
         "ceragon_RxBitrate",
     );
-
+} else {
+    $mib_graphs = array(
+        "ceragon_RxLevel",
+        "ceragon_TxPower",
+        "ceragon_MSE",
+        "ceragon_DefectedBlocks",
+        "ceragon_TxBitrate",
+        "ceragon_RxBitrate",
+    );
+}
     unset($graph, $oids, $oid);
     poll_mib_def($device, "MWRM-RADIO-MIB:ceragon-radio", "ceragon", $mib_oids, $mib_graphs, $graphs);
 

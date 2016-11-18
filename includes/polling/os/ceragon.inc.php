@@ -44,5 +44,20 @@ $serial = snmp_walk($device, 'genEquipInventorySerialNumber', '-mMWRM-RADIO-MIB 
 $latitude = snmp_walk($device, 'genEquipUnitLatitude', '-mMWRM-RADIO-MIB -Oqv', '');
 $longitude = snmp_walk($device, 'genEquipUnitLongitude', '-mMWRM-RADIO-MIB -Oqv', '');
 
-?>
+$IfIndex = 0;
+$num_radios = 0;
+$IfNumber = snmp_get_next($device, "ifNumber", "-mIF-MIB -Oqv", "");
 
+for ($i=0; $i < $IfNumber; $i++) {
+    if ($IfIndex == "0") {
+        $IfIndex = snmp_get_next($device, "ifIndex", "-mIF-MIB -Oqv", "");
+    } else {
+        $IfIndex = snmp_get_next($device, "ifIndex.$IfIndex", "-mIF-MIB -Oqv", "");
+    }
+    $IfDescr = snmp_get($device, "ifDescr.$IfIndex", "-mIF-MIB -Oqv", "");
+    $IfName = snmp_get($device, "ifName.$IfIndex", "-mIF-MIB -Oqv", "");
+    if (stristr($IfDescr, "Radio")) {
+        $num_radios = $num_radios+1;
+    }
+}
+$features = $num_radios . " radios in unit";
