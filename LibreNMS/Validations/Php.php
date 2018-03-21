@@ -26,11 +26,10 @@
 namespace LibreNMS\Validations;
 
 use LibreNMS\Config;
-use LibreNMS\Interfaces\ValidationGroup;
 use LibreNMS\ValidationResult;
 use LibreNMS\Validator;
 
-class Php implements ValidationGroup
+class Php extends BaseValidation
 {
     /**
      * Validate this module.
@@ -53,7 +52,7 @@ class Php implements ValidationGroup
 
         // if update is not set to false and version is min or newer
         if (Config::get('update') && version_compare(PHP_VERSION, $min_version, '<')) {
-            $validator->warn('PHP version 5.6.4 will be the minimum supported version on January 10, 2018.  We recommend you update to PHP a supported version of PHP (7.1 suggested) to continue to receive updates.  If you do not update PHP, LibreNMS will continue to function but stop receiving bug fixes and updates.');
+            $validator->warn('PHP version 5.6.4 is the minimum supported version as of January 10, 2018.  We recommend you update to PHP a supported version of PHP (7.1 suggested) to continue to receive updates.  If you do not update PHP, LibreNMS will continue to function but stop receiving bug fixes and updates.');
         }
     }
 
@@ -80,7 +79,7 @@ class Php implements ValidationGroup
 
     private function checkExtensions(Validator $validator)
     {
-        $required_modules = array('mysqli','pcre','curl','session','snmp', 'xml', 'gd');
+        $required_modules = array('mysqli','pcre','curl','session', 'xml', 'gd');
 
         if (Config::get('distributed_poller')) {
             $required_modules[] = 'memcached';
@@ -160,15 +159,5 @@ class Php implements ValidationGroup
                 );
             }
         }
-    }
-
-    /**
-     * Returns if this test should be run by default or not.
-     *
-     * @return bool
-     */
-    public function isDefault()
-    {
-        return true;
     }
 }
