@@ -155,6 +155,8 @@ class CustomMapDataController extends Controller
                 'text_face' => $node->text_face,
                 'text_size' => $node->text_size,
                 'text_colour' => $node->text_colour,
+                'label_bg_colour' => $node->label_bg_colour,
+                'label_offset_y' => $node->label_offset_y,
                 'colour_bg' => $node->colour_bg,
                 'colour_bdr' => $node->colour_bdr,
                 'colour_bg_view' => $node->colour_bg,
@@ -254,6 +256,8 @@ class CustomMapDataController extends Controller
                 $dbnode->text_face = $node['font']['face'];
                 $dbnode->text_size = $node['font']['size'];
                 $dbnode->text_colour = $node['font']['color'];
+                $dbnode->label_bg_colour = $node['label_bg_colour'] ?: null;
+                $dbnode->label_offset_y = isset($node['font']['vadjust']) ? intval($node['font']['vadjust']) : null;
                 $dbnode->colour_bg = $node['color']['background'] ?? null;
                 $dbnode->colour_bdr = $node['color']['border'] ?? null;
                 $dbnode->border_width = $node['borderWidth'];

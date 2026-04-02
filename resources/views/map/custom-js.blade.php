@@ -145,8 +145,13 @@
             } else {
                 node_cfg.image = undefined;
             }
-            if(! ["ellipse", "circle", "database", "box", "text"].includes(node.style)) {
+            if (node.label_bg_colour) {
+                node_cfg.font.background = node.label_bg_colour;
+            } else if(! ["ellipse", "circle", "database", "box", "text"].includes(node_cfg.shape)) {
                 node_cfg.font.background = "#FFFFFF";
+            }
+            if (node.label_offset_y != null) {
+                node_cfg.font.vadjust = node.label_offset_y;
             }
             return node_cfg;
         },
