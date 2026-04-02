@@ -18,10 +18,22 @@ OPTIONS
   --sql-file FILE
       Write SQL to FILE instead of stdout.
 
-  --force
+  --reset-table-ids
       Batch mode only.  Before inserting, TRUNCATE custom_maps,
       custom_map_nodes and custom_map_edges, resetting all auto-increment
       counters to 1.  In SQL output mode this prepends TRUNCATE statements.
+
+  --skip-circular-deps
+      Batch mode only.  When circular map dependencies are detected (map A
+      links to map B and map B links back to map A), break the cycle by
+      nulling out the back-link rather than aborting.  A warning is printed
+      for each link that is dropped.  Nodes affected will still appear on
+      the map but will not navigate to their target map when clicked.
+
+  --force
+      Batch mode.  Implies --reset-table-ids and --skip-circular-deps.
+      Prints a warning banner and proceeds regardless of dependency errors.
+      Use when you just want everything imported and will fix links manually.
 
   --librenms-path PATH
       LibreNMS root directory containing config.php.  Auto-detected from
@@ -51,10 +63,18 @@ BATCH MODE
     SomeMap if SomeMap.conf exists in the same directory.  The node is
     styled as circularImage automatically.
 
-  --force (batch mode)
+  --reset-table-ids (batch mode)
     Truncates all three custom-map tables and resets their auto-increment
     counters before inserting.  Useful for a clean full re-import.
     In SQL mode this prepends TRUNCATE statements to the output file.
+
+  --skip-circular-deps (batch mode)
+    Breaks circular map-link dependencies by nulling out the back-edge
+    rather than aborting.  Affected nodes get linked_custom_map_id = NULL.
+
+  --force (batch mode)
+    Implies --reset-table-ids + --skip-circular-deps.  Prints a warning
+    and proceeds regardless of dependency errors.
 
 EXAMPLES
   # Single map → SQL on stdout
@@ -68,6 +88,10 @@ EXAMPLES
       --output direct
 
   # Batch: wipe existing custom maps first, then re-import everything
+  weathermap_to_custom_map.py /opt/librenms/html/plugins/Weathermap/configs \\
+      --output direct --reset-table-ids
+
+  # Batch: reset tables + ignore circular dependencies + other errors
   weathermap_to_custom_map.py /opt/librenms/html/plugins/Weathermap/configs \\
       --output direct --force
 
@@ -1009,6 +1033,61 @@ def topological_sort(graph: Dict[str, set]) -> List[str]:
     return result
 
 
+def break_dependency_cycles(graph: Dict[str, set], cfgs: Dict[str, WMConfig]) -> List[tuple]:
+    """
+    Iteratively detect and break cycles in the dependency graph by removing
+    one back-edge per cycle until no cycles remain.
+
+    For each removed edge (stem_a depends_on stem_b), the corresponding
+    node.linked_map_name is cleared to None in cfgs[stem_a] so the node
+    gets linked_custom_map_id = NULL in the output.
+
+    Returns list of (from_stem, to_stem) pairs that were removed.
+    Modifies graph and cfgs in place.
+    """
+    removed = []
+
+    while True:
+        # Kahn's pass to find which nodes are stuck in cycles
+        in_degree = {n: len(deps) for n, deps in graph.items()}
+        queue = sorted(n for n, d in in_degree.items() if d == 0)
+        processed = []
+
+        while queue:
+            node = queue.pop(0)
+            processed.append(node)
+            for n, deps in graph.items():
+                if node in deps:
+                    in_degree[n] -= 1
+                    if in_degree[n] == 0:
+                        queue.append(n)
+                        queue.sort()
+
+        if len(processed) == len(graph):
+            break  # No more cycles
+
+        # Nodes not yet processed are in cycles
+        cycle_nodes = sorted(n for n in graph if n not in processed)
+
+        # Pick the first cycle node and remove its first cycle-internal dependency
+        node = cycle_nodes[0]
+        cycle_deps = sorted(dep for dep in graph[node] if dep in cycle_nodes)
+        if not cycle_deps:
+            cycle_deps = sorted(graph[node])  # fallback: shouldn't happen
+
+        dep = cycle_deps[0]
+        graph[node].discard(dep)
+        removed.append((node, dep))
+
+        # Null out the matching node link in the WMConfig
+        if node in cfgs and dep in cfgs:
+            for wm_node in cfgs[node].nodes.values():
+                if wm_node.linked_map_name == dep:
+                    wm_node.linked_map_name = None
+
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Batch SQL generation
 # ---------------------------------------------------------------------------
@@ -1026,7 +1105,8 @@ _TRUNCATE_SQL = textwrap.dedent("""\
 
 def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
                        map_names: Dict[str, str], use_icons: bool = True,
-                       menu_group: Optional[str] = None, force: bool = False) -> str:
+                       menu_group: Optional[str] = None,
+                       reset_table_ids: bool = False) -> str:
     """
     Generate a single SQL script that inserts all maps in dependency order.
     Each map gets a unique SQL user variable for its ID so that later maps can
@@ -1036,7 +1116,7 @@ def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
     all_map_vars: Dict[str, str] = {stem: _map_var_for_stem(stem) for stem in ordered_stems}
 
     parts = []
-    if force:
+    if reset_table_ids:
         parts.append(_TRUNCATE_SQL)
 
     for stem in ordered_stems:
@@ -1061,12 +1141,12 @@ def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
 def batch_insert_direct(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
                         map_names: Dict[str, str], db_conf: dict,
                         use_icons: bool = True, menu_group: Optional[str] = None,
-                        force: bool = False) -> None:
+                        reset_table_ids: bool = False) -> None:
     """Insert all maps in dependency order using a single DB connection."""
     conn = _connect(db_conf)
     cursor = conn.cursor()
     try:
-        if force:
+        if reset_table_ids:
             print('Truncating custom map tables...', file=sys.stderr)
             cursor.execute('SET FOREIGN_KEY_CHECKS=0')
             cursor.execute('TRUNCATE TABLE `custom_map_edges`')
@@ -1151,8 +1231,12 @@ def main():
         help='Output mode: sql (default), direct (DB insert), both',
     )
     parser.add_argument('--sql-file', default=None, help='Write SQL to this file (default: stdout)')
+    parser.add_argument('--reset-table-ids', action='store_true',
+                        help='Batch: TRUNCATE custom map tables before inserting')
+    parser.add_argument('--skip-circular-deps', action='store_true',
+                        help='Batch: break circular map-link dependencies (null the back-edge) instead of aborting')
     parser.add_argument('--force', action='store_true',
-                        help='Batch mode: TRUNCATE custom map tables before inserting')
+                        help='Batch: implies --reset-table-ids + --skip-circular-deps; prints a warning and proceeds regardless of dependency errors')
     parser.add_argument('--librenms-path', default=None,
                         help='LibreNMS root directory (contains config.php)')
     parser.add_argument('--db-host', default=None)
@@ -1178,6 +1262,19 @@ def main():
     # -----------------------------------------------------------------------
     if os.path.isdir(args.path):
         configs_dir = args.path
+
+        # --force implies --reset-table-ids + --skip-circular-deps
+        reset_table_ids = args.reset_table_ids or args.force
+        skip_circular_deps = args.skip_circular_deps or args.force
+
+        if args.force:
+            print(
+                'WARNING: --force mode active.  Tables will be truncated and circular '
+                'dependencies will be broken by nulling back-links.  Check the output '
+                'for "DROPPED CYCLE EDGE" warnings to see which map links were lost.',
+                file=sys.stderr,
+            )
+
         stems = discover_configs(configs_dir)
         if not stems:
             print('ERROR: No .conf files found in {}'.format(configs_dir), file=sys.stderr)
@@ -1193,6 +1290,9 @@ def main():
             try:
                 cfg = parse_weathermap_conf(path)
             except Exception as e:
+                if args.force:
+                    print('WARNING: skipping {}: {}'.format(path, e), file=sys.stderr)
+                    continue
                 print('ERROR parsing {}: {}'.format(path, e), file=sys.stderr)
                 sys.exit(1)
             cfgs[stem] = cfg
@@ -1210,12 +1310,25 @@ def main():
         if linked_count:
             print('{} cross-map node link(s) resolved.'.format(linked_count), file=sys.stderr)
 
-        # Topological sort (dependencies first)
+        # Topological sort — with optional cycle breaking
         graph = build_dependency_graph(cfgs)
+
+        if skip_circular_deps:
+            removed_edges = break_dependency_cycles(graph, cfgs)
+            for (from_stem, to_stem) in removed_edges:
+                print(
+                    'WARNING: DROPPED CYCLE EDGE {!r} -> {!r}: '
+                    'linked_custom_map_id will be NULL for affected node(s).'.format(
+                        from_stem, to_stem),
+                    file=sys.stderr,
+                )
+
         try:
             ordered_stems = topological_sort(graph)
         except ValueError as e:
             print('ERROR: {}'.format(e), file=sys.stderr)
+            print('Hint: use --skip-circular-deps (or --force) to break cycles automatically.',
+                  file=sys.stderr)
             sys.exit(1)
 
         print('Insertion order: {}'.format(' -> '.join(ordered_stems)), file=sys.stderr)
@@ -1225,7 +1338,7 @@ def main():
                 ordered_stems, cfgs, map_names,
                 use_icons=use_icons,
                 menu_group=args.menu_group,
-                force=args.force,
+                reset_table_ids=reset_table_ids,
             )
             if args.sql_file:
                 with open(args.sql_file, 'w') as f:
@@ -1240,7 +1353,7 @@ def main():
                 ordered_stems, cfgs, map_names, db_conf,
                 use_icons=use_icons,
                 menu_group=args.menu_group,
-                force=args.force,
+                reset_table_ids=reset_table_ids,
             )
 
     # -----------------------------------------------------------------------
