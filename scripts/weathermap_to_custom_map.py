@@ -1,26 +1,80 @@
 #!/usr/bin/env python3
 """
-weathermap_to_custom_map.py
+weathermap_to_custom_map.py  —  Convert PHP Weathermap .conf files to LibreNMS Custom Maps.
 
-Convert a PHP Weathermap .conf file to a LibreNMS Custom Map.
+USAGE
+  Single map:
+    weathermap_to_custom_map.py  <config.conf>  [options]
 
-Outputs SQL INSERT statements and/or inserts directly into the LibreNMS
-MariaDB/MySQL database.
+  Batch (entire configs directory, sub-map links resolved automatically):
+    weathermap_to_custom_map.py  <configs_dir>  [options]
 
-Usage:
-    python3 weathermap_to_custom_map.py <config.conf> [options]
+OPTIONS
+  --output sql|direct|both
+      sql     Write SQL INSERT statements to stdout or --sql-file (default).
+      direct  Insert directly into the LibreNMS database.
+      both    Do both.
 
-Options:
-    --output sql|direct|both   Output mode (default: sql)
-    --sql-file FILE            Write SQL to FILE instead of stdout
-    --librenms-path PATH       Path to LibreNMS root (to find config.php)
-    --db-host HOST             Override DB host
-    --db-user USER             Override DB user
-    --db-pass PASS             Override DB password
-    --db-name DB               Override DB name
-    --map-name NAME            Override map name (default: from TITLE in conf)
-    --menu-group NAME          Set map menu group
-    --no-icons                 Use box nodes instead of device image icons
+  --sql-file FILE
+      Write SQL to FILE instead of stdout.
+
+  --force
+      Batch mode only.  Before inserting, TRUNCATE custom_maps,
+      custom_map_nodes and custom_map_edges, resetting all auto-increment
+      counters to 1.  In SQL output mode this prepends TRUNCATE statements.
+
+  --librenms-path PATH
+      LibreNMS root directory containing config.php.  Auto-detected from
+      the script location or the conf file location if omitted.
+
+  --db-host HOST | --db-user USER | --db-pass PASS | --db-name DB
+      Override individual database credentials read from config.php.
+
+  --map-name NAME
+      Override the map name (single-map mode only; default: TITLE in conf).
+
+  --menu-group NAME
+      Assign all converted maps to this menu group.
+
+  --no-icons
+      Use plain labelled box nodes instead of device-icon image nodes.
+
+BATCH MODE
+  When the positional argument is a directory the script scans it for *.conf
+  files, parses them all, detects cross-map links by matching each node's
+  INFOURL against the basenames of all discovered conf files, then generates
+  or inserts all maps in dependency order so that linked_custom_map_id foreign
+  keys are populated correctly.
+
+  Cross-map link detection
+    A node whose INFOURL ends with  /SomeMap.html  will be linked to
+    SomeMap if SomeMap.conf exists in the same directory.  The node is
+    styled as circularImage automatically.
+
+  --force (batch mode)
+    Truncates all three custom-map tables and resets their auto-increment
+    counters before inserting.  Useful for a clean full re-import.
+    In SQL mode this prepends TRUNCATE statements to the output file.
+
+EXAMPLES
+  # Single map → SQL on stdout
+  weathermap_to_custom_map.py LreaCore.conf
+
+  # Single map → insert into database
+  weathermap_to_custom_map.py LreaCore.conf --output direct
+
+  # Batch: convert all maps in the Weathermap configs directory
+  weathermap_to_custom_map.py /opt/librenms/html/plugins/Weathermap/configs \\
+      --output direct
+
+  # Batch: wipe existing custom maps first, then re-import everything
+  weathermap_to_custom_map.py /opt/librenms/html/plugins/Weathermap/configs \\
+      --output direct --force
+
+  # Batch: generate SQL to review before applying
+  weathermap_to_custom_map.py /opt/librenms/html/plugins/Weathermap/configs \\
+      --sql-file all_maps.sql
+  mysql -u librenms -p librenms < all_maps.sql
 """
 
 import argparse
@@ -31,7 +85,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +100,8 @@ class WMNode:
     device_id: Optional[int] = None
     label: Optional[str] = None   # None means "use node name"
     icon: Optional[str] = None    # icon filename from Weathermap conf
+    infourl: Optional[str] = None          # raw INFOURL directive value
+    linked_map_name: Optional[str] = None  # resolved stem of linked conf (batch mode)
 
 
 @dataclass
@@ -190,6 +246,8 @@ def parse_weathermap_conf(path: str) -> WMConfig:
                     # ICON 100 35 images/foo.png  or  ICON images/foo.png
                     icon_parts = rest.strip().split()
                     current_node.icon = icon_parts[-1]
+                elif keyword == 'INFOURL':
+                    current_node.infourl = rest.strip()
                 elif keyword == 'SET':
                     set_parts = rest.split(None, 1)
                     if len(set_parts) == 2 and set_parts[0].lower() == 'device_id':
@@ -447,8 +505,28 @@ def _link_fixed_width(link: WMLink, cfg: WMConfig) -> str:
     return 'NULL'
 
 
+def _node_var(node_name: str) -> str:
+    """Return the SQL user variable name for a node."""
+    return '@node_' + re.sub(r'[^a-zA-Z0-9_]', '_', node_name)
+
+
+def _map_var_for_stem(stem: str) -> str:
+    """Return the SQL user variable name for a map identified by its conf stem."""
+    return '@map_{}_id'.format(re.sub(r'[^a-zA-Z0-9_]', '_', stem))
+
+
 def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
-                 menu_group: Optional[str] = None) -> str:
+                 menu_group: Optional[str] = None,
+                 map_var: str = '@map_id',
+                 all_map_vars: Optional[Dict[str, str]] = None) -> str:
+    """
+    Generate SQL INSERT statements for one map.
+
+    map_var       — SQL variable to SET after the map INSERT (default '@map_id').
+                    In batch mode pass a unique variable per map, e.g. '@map_LreaCore_id'.
+    all_map_vars  — {stem: sql_var} dict for resolving linked_custom_map_id on nodes.
+                    Only needed in batch mode.
+    """
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     legend_colours = build_legend_colours(cfg.scales)
     # legend_steps = count of non-negative numeric keys (shown as colour swatches)
@@ -493,7 +571,7 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
         ),
         '  {now}, {now}'.format(now=sql_escape(now)),
         ');',
-        'SET @map_id = LAST_INSERT_ID();',
+        'SET {} = LAST_INSERT_ID();'.format(map_var),
         '',
         '-- ----------------------------------------------------------------',
         '-- custom_map_nodes',
@@ -501,23 +579,31 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
     ]
 
     for node in cfg.nodes.values():
-        var_name = '@node_' + re.sub(r'[^a-zA-Z0-9_]', '_', node.name)
+        var_name = _node_var(node.name)
         device_id_sql = str(node.device_id) if node.device_id is not None else 'NULL'
         label = (node.label or node.name)[:50]
         style, image = node_style_and_image(node, use_icons)
 
         lhighlight = node_label_stroke_colour(style)
+
+        # Resolve linked_custom_map_id for map-link nodes (batch mode)
+        linked_id_sql = 'NULL'
+        if node.linked_map_name and all_map_vars and node.linked_map_name in all_map_vars:
+            linked_id_sql = all_map_vars[node.linked_map_name]
+
         lines += [
             '-- Node: {}'.format(node.name),
             'INSERT INTO `custom_map_nodes` (',
-            '  `custom_map_id`, `device_id`, `label`, `style`, `icon`, `image`,',
+            '  `custom_map_id`, `device_id`, `linked_custom_map_id`, `label`, `style`, `icon`, `image`,',
             '  `size`, `border_width`, `text_face`, `text_size`, `text_colour`,',
             '  `label_stroke_colour`, `label_offset_y`,',
             '  `colour_bg`, `colour_bdr`, `x_pos`, `y_pos`,',
             '  `created_at`, `updated_at`',
             ') VALUES (',
-            '  @map_id, {device_id}, {label}, {style}, NULL, {image},'.format(
+            '  {map_var}, {device_id}, {linked_id}, {label}, {style}, NULL, {image},'.format(
+                map_var=map_var,
                 device_id=device_id_sql,
+                linked_id=linked_id_sql,
                 label=sql_escape(label),
                 style=sql_escape(style),
                 image=sql_escape(image or ''),
@@ -552,8 +638,8 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
         if link.node2 not in cfg.nodes:
             warnings.append('WARNING: Link {} references unknown node {}'.format(link.name, link.node2))
 
-        var1 = '@node_' + re.sub(r'[^a-zA-Z0-9_]', '_', link.node1)
-        var2 = '@node_' + re.sub(r'[^a-zA-Z0-9_]', '_', link.node2)
+        var1 = _node_var(link.node1)
+        var2 = _node_var(link.node2)
         # Use a scalar subquery so the INSERT gracefully stores NULL when the
         # port doesn't exist in this DB, rather than failing the FK constraint.
         if link.port_id is not None:
@@ -579,17 +665,17 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
             '  `custom_map_id`, `custom_map_node1_id`, `custom_map_node2_id`,',
             '  `port_id`, `reverse`, `style`, `showpct`, `showbps`, `label`,',
             '  `fixed_width`,',
-            '  `text_face`, `text_size`, `text_colour`, `mid_x`, `mid_y`,',
+            '  `text_face`, `text_size`, `text_colour`, `label_stroke_colour`, `mid_x`, `mid_y`,',
             '  `created_at`, `updated_at`',
             ') VALUES (',
-            '  @map_id, {v1}, {v2},'.format(v1=var1, v2=var2),
+            '  {map_var}, {v1}, {v2},'.format(map_var=map_var, v1=var1, v2=var2),
             '  {port_id}, 0, {style}, 0, 1, {label},'.format(
                 port_id=port_id_sql,
                 style=sql_escape('dynamic'),
                 label=sql_escape(edge_label),
             ),
             '  {},'.format(fixed_width_sql),
-            '  {face}, 12, {tc}, {mid_x}, {mid_y},'.format(
+            '  {face}, 12, {tc}, NULL, {mid_x}, {mid_y},'.format(
                 face=sql_escape('arial'),
                 tc=sql_escape('#343434'),
                 mid_x=mid_x, mid_y=mid_y,
@@ -656,11 +742,11 @@ def find_librenms_path(start: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Direct DB insert
+# DB connection helper
 # ---------------------------------------------------------------------------
 
-def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
-                  use_icons: bool = True, menu_group: Optional[str] = None) -> None:
+def _connect(db_conf: dict):
+    """Open and return a database connection using pymysql or mysql.connector."""
     try:
         import pymysql as mysql_driver
     except ImportError:
@@ -681,16 +767,31 @@ def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
     if 'port' in db_conf:
         connect_kwargs['port'] = int(db_conf['port'])
 
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    return mysql_driver.connect(**connect_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Direct DB insert (single map)
+# ---------------------------------------------------------------------------
+
+def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
+                    use_icons: bool = True, menu_group: Optional[str] = None,
+                    map_id_map: Optional[Dict[str, int]] = None,
+                    now: Optional[str] = None) -> int:
+    """
+    Insert one map (nodes + edges) using an existing cursor.  Returns map_id.
+
+    map_id_map  — {stem: map_id} of already-inserted maps, used to resolve
+                  linked_custom_map_id for map-link nodes (batch mode).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
     legend_colours = build_legend_colours(cfg.scales)
     legend_steps = sum(1 for k in legend_colours if k.lstrip('-').isdigit() and int(k) >= 0)
 
-    conn = mysql_driver.connect(**connect_kwargs)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            """INSERT INTO `custom_maps`
+    cursor.execute(
+        """INSERT INTO `custom_maps`
                (`name`, `width`, `height`, `menu_group`,
                 `node_align`, `reverse_arrows`, `edge_separation`,
                 `legend_x`, `legend_y`, `legend_steps`, `legend_font_size`,
@@ -699,100 +800,117 @@ def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
                 `options`, `newnodeconfig`, `newedgeconfig`,
                 `created_at`, `updated_at`)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (
-                map_name,
-                '{}px'.format(cfg.width),
-                '{}px'.format(cfg.height),
-                menu_group,
-                10, 0, 0,
-                cfg.keypos_x, cfg.keypos_y, legend_steps, 14,
-                0, 0, json.dumps(legend_colours),
-                'none', None,
-                json.dumps(DEFAULT_OPTIONS),
-                json.dumps(DEFAULT_NEWNODECONFIG),
-                json.dumps(DEFAULT_NEWEDGECONFIG),
-                now, now,
-            )
+        (
+            map_name,
+            '{}px'.format(cfg.width),
+            '{}px'.format(cfg.height),
+            menu_group,
+            10, 0, 0,
+            cfg.keypos_x, cfg.keypos_y, legend_steps, 14,
+            0, 0, json.dumps(legend_colours),
+            'none', None,
+            json.dumps(DEFAULT_OPTIONS),
+            json.dumps(DEFAULT_NEWNODECONFIG),
+            json.dumps(DEFAULT_NEWEDGECONFIG),
+            now, now,
         )
-        map_id = cursor.lastrowid
-        print('Created custom map id={} name={!r}'.format(map_id, map_name))
+    )
+    map_id = cursor.lastrowid
+    print('Created custom map id={} name={!r}'.format(map_id, map_name))
 
-        node_ids = {}
-        for node in cfg.nodes.values():
-            label = (node.label or node.name)[:50]
-            style, image = node_style_and_image(node, use_icons)
+    node_ids = {}
+    for node in cfg.nodes.values():
+        label = (node.label or node.name)[:50]
+        style, image = node_style_and_image(node, use_icons)
 
-            cursor.execute(
-                """INSERT INTO `custom_map_nodes`
-                   (`custom_map_id`, `device_id`, `label`, `style`, `icon`, `image`,
+        linked_map_id = None
+        if node.linked_map_name and map_id_map:
+            linked_map_id = map_id_map.get(node.linked_map_name)
+
+        cursor.execute(
+            """INSERT INTO `custom_map_nodes`
+                   (`custom_map_id`, `device_id`, `linked_custom_map_id`, `label`, `style`, `icon`, `image`,
                     `size`, `border_width`, `text_face`, `text_size`, `text_colour`,
                     `label_stroke_colour`, `label_offset_y`,
                     `colour_bg`, `colour_bdr`, `x_pos`, `y_pos`,
                     `created_at`, `updated_at`)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    map_id,
-                    node.device_id,
-                    label,
-                    style,
-                    None,
-                    image or '',
-                    node_size(style), 1, 'arial', 14, '#343434',
-                    node_label_stroke_colour(style), None,
-                    node_colours(style)[0], node_colours(style)[1],
-                    node.x_pos, node.y_pos,
-                    now, now,
-                )
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                map_id,
+                node.device_id,
+                linked_map_id,
+                label,
+                style,
+                None,
+                image or '',
+                node_size(style), 1, 'arial', 14, '#343434',
+                node_label_stroke_colour(style), None,
+                node_colours(style)[0], node_colours(style)[1],
+                node.x_pos, node.y_pos,
+                now, now,
             )
-            node_ids[node.name] = cursor.lastrowid
-            print('  Node {!r} id={} device_id={} style={!r}'.format(
-                node.name, node_ids[node.name], node.device_id, style))
+        )
+        node_ids[node.name] = cursor.lastrowid
+        print('  Node {!r} id={} device_id={} style={!r} linked_map_id={}'.format(
+            node.name, node_ids[node.name], node.device_id, style, linked_map_id))
 
-        for link in cfg.links:
-            n1_id = node_ids.get(link.node1)
-            n2_id = node_ids.get(link.node2)
-            if n1_id is None or n2_id is None:
-                print('WARNING: skipping link {!r}: node not found ({!r}, {!r})'.format(
-                    link.name, link.node1, link.node2), file=sys.stderr)
-                continue
+    for link in cfg.links:
+        n1_id = node_ids.get(link.node1)
+        n2_id = node_ids.get(link.node2)
+        if n1_id is None or n2_id is None:
+            print('WARNING: skipping link {!r}: node not found ({!r}, {!r})'.format(
+                link.name, link.node1, link.node2), file=sys.stderr)
+            continue
 
-            n1 = cfg.nodes.get(link.node1)
-            n2 = cfg.nodes.get(link.node2)
-            mid_x = ((n1.x_pos + n2.x_pos) // 2) if (n1 and n2) else 0
-            mid_y = ((n1.y_pos + n2.y_pos) // 2) if (n1 and n2) else 0
+        n1 = cfg.nodes.get(link.node1)
+        n2 = cfg.nodes.get(link.node2)
+        mid_x = ((n1.x_pos + n2.x_pos) // 2) if (n1 and n2) else 0
+        mid_y = ((n1.y_pos + n2.y_pos) // 2) if (n1 and n2) else 0
 
-            edge_label = link.incomment or link.bandwidth or ''
-            w = link.width if link.width is not None else cfg.default_link_width
+        edge_label = link.incomment or link.bandwidth or ''
+        w = link.width if link.width is not None else cfg.default_link_width
 
-            # Validate port_id: set to None if the port doesn't exist in this DB
-            port_id = link.port_id
-            if port_id is not None:
-                cursor.execute('SELECT `port_id` FROM `ports` WHERE `port_id` = %s LIMIT 1', (port_id,))
-                if cursor.fetchone() is None:
-                    print('  WARNING: port_id={} not found in DB for link {!r}, storing NULL'.format(
-                        port_id, link.name), file=sys.stderr)
-                    port_id = None
+        # Validate port_id: set to None if the port doesn't exist in this DB
+        port_id = link.port_id
+        if port_id is not None:
+            cursor.execute('SELECT `port_id` FROM `ports` WHERE `port_id` = %s LIMIT 1', (port_id,))
+            if cursor.fetchone() is None:
+                print('  WARNING: port_id={} not found in DB for link {!r}, storing NULL'.format(
+                    port_id, link.name), file=sys.stderr)
+                port_id = None
 
-            cursor.execute(
-                """INSERT INTO `custom_map_edges`
+        cursor.execute(
+            """INSERT INTO `custom_map_edges`
                    (`custom_map_id`, `custom_map_node1_id`, `custom_map_node2_id`,
                     `port_id`, `reverse`, `style`, `showpct`, `showbps`, `label`,
                     `fixed_width`,
-                    `text_face`, `text_size`, `text_colour`, `mid_x`, `mid_y`,
+                    `text_face`, `text_size`, `text_colour`, `label_stroke_colour`, `mid_x`, `mid_y`,
                     `created_at`, `updated_at`)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    map_id, n1_id, n2_id,
-                    port_id, 0, 'dynamic', 0, 1, edge_label,
-                    w,
-                    'arial', 12, '#343434', mid_x, mid_y,
-                    now, now,
-                )
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                map_id, n1_id, n2_id,
+                port_id, 0, 'dynamic', 0, 1, edge_label,
+                w,
+                'arial', 12, '#343434', None, mid_x, mid_y,
+                now, now,
             )
-            print('  Edge {!r} port_id={} width={}'.format(link.name, port_id, w))
+        )
+        print('  Edge {!r} port_id={} width={}'.format(link.name, port_id, w))
 
+    return map_id
+
+
+def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
+                  use_icons: bool = True, menu_group: Optional[str] = None,
+                  map_id_map: Optional[Dict[str, int]] = None) -> int:
+    """Insert a single map into the DB. Returns the new map_id."""
+    conn = _connect(db_conf)
+    cursor = conn.cursor()
+    try:
+        map_id = _insert_one_map(cursor, cfg, map_name, use_icons, menu_group, map_id_map)
         conn.commit()
         print('Done.')
+        return map_id
     except Exception:
         conn.rollback()
         raise
@@ -802,85 +920,371 @@ def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
 
 
 # ---------------------------------------------------------------------------
+# Batch mode: config discovery and dependency resolution
+# ---------------------------------------------------------------------------
+
+def discover_configs(configs_dir: str) -> List[str]:
+    """Return sorted list of .conf file stems found in configs_dir."""
+    stems = []
+    try:
+        entries = sorted(os.scandir(configs_dir), key=lambda e: e.name.lower())
+    except OSError as e:
+        print('ERROR: Cannot scan {}: {}'.format(configs_dir, e), file=sys.stderr)
+        sys.exit(1)
+    for entry in entries:
+        if entry.is_file() and entry.name.lower().endswith('.conf'):
+            stems.append(os.path.splitext(entry.name)[0])
+    return stems
+
+
+def parse_infourl_map_ref(infourl: str) -> Optional[str]:
+    """
+    Extract the conf file stem from an INFOURL value.
+      '/weathermap/output/SomeMap.html'  ->  'SomeMap'
+      'http://host/page/SomeMap.html'    ->  'SomeMap'
+    Returns None if no .html reference is found.
+    """
+    m = re.search(r'/([^/]+)\.html\b', infourl, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def resolve_map_links(cfgs: Dict[str, WMConfig]) -> None:
+    """
+    For each node with an INFOURL that references a known conf stem, set
+    node.linked_map_name to that stem so the batch inserter can populate
+    linked_custom_map_id.
+    """
+    known_stems = set(cfgs.keys())
+    for cfg in cfgs.values():
+        for node in cfg.nodes.values():
+            if node.infourl and node.linked_map_name is None:
+                ref = parse_infourl_map_ref(node.infourl)
+                if ref and ref in known_stems:
+                    node.linked_map_name = ref
+
+
+def build_dependency_graph(cfgs: Dict[str, WMConfig]) -> Dict[str, set]:
+    """
+    Return {stem: set_of_stems_it_depends_on}.
+    Map A depends on map B if any of A's nodes links to B (so B must be
+    inserted before A to satisfy the linked_custom_map_id FK).
+    """
+    graph: Dict[str, set] = {stem: set() for stem in cfgs}
+    for stem, cfg in cfgs.items():
+        for node in cfg.nodes.values():
+            dep = node.linked_map_name
+            if dep and dep in graph and dep != stem:
+                graph[stem].add(dep)
+    return graph
+
+
+def topological_sort(graph: Dict[str, set]) -> List[str]:
+    """
+    Kahn's algorithm. graph[node] = set of nodes that must be inserted BEFORE node.
+    Returns an ordered list where all dependencies precede their dependents.
+    Raises ValueError on circular dependencies.
+    """
+    in_degree = {n: len(deps) for n, deps in graph.items()}
+    # Queue initialised with nodes that have no dependencies (stable sort by name)
+    queue = sorted(n for n, d in in_degree.items() if d == 0)
+    result: List[str] = []
+
+    while queue:
+        node = queue.pop(0)
+        result.append(node)
+        # Reduce in-degree for all nodes that depended on this one
+        for n, deps in graph.items():
+            if node in deps:
+                in_degree[n] -= 1
+                if in_degree[n] == 0:
+                    queue.append(n)
+                    queue.sort()
+
+    if len(result) != len(graph):
+        cycle = [n for n in graph if n not in result]
+        raise ValueError('Circular dependency detected among maps: {}'.format(', '.join(sorted(cycle))))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Batch SQL generation
+# ---------------------------------------------------------------------------
+
+_TRUNCATE_SQL = textwrap.dedent("""\
+    -- Force: truncate all custom map tables and reset auto-increment
+    SET FOREIGN_KEY_CHECKS=0;
+    TRUNCATE TABLE `custom_map_edges`;
+    TRUNCATE TABLE `custom_map_nodes`;
+    TRUNCATE TABLE `custom_maps`;
+    SET FOREIGN_KEY_CHECKS=1;
+
+""")
+
+
+def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
+                       map_names: Dict[str, str], use_icons: bool = True,
+                       menu_group: Optional[str] = None, force: bool = False) -> str:
+    """
+    Generate a single SQL script that inserts all maps in dependency order.
+    Each map gets a unique SQL user variable for its ID so that later maps can
+    reference it via linked_custom_map_id.
+    """
+    # Build {stem: '@map_<stem>_id'} for cross-map variable references
+    all_map_vars: Dict[str, str] = {stem: _map_var_for_stem(stem) for stem in ordered_stems}
+
+    parts = []
+    if force:
+        parts.append(_TRUNCATE_SQL)
+
+    for stem in ordered_stems:
+        cfg = cfgs[stem]
+        map_name = map_names[stem]
+        sql = generate_sql(
+            cfg, map_name,
+            use_icons=use_icons,
+            menu_group=menu_group,
+            map_var=all_map_vars[stem],
+            all_map_vars=all_map_vars,
+        )
+        parts.append(sql)
+
+    return '\n'.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Batch direct insert
+# ---------------------------------------------------------------------------
+
+def batch_insert_direct(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
+                        map_names: Dict[str, str], db_conf: dict,
+                        use_icons: bool = True, menu_group: Optional[str] = None,
+                        force: bool = False) -> None:
+    """Insert all maps in dependency order using a single DB connection."""
+    conn = _connect(db_conf)
+    cursor = conn.cursor()
+    try:
+        if force:
+            print('Truncating custom map tables...', file=sys.stderr)
+            cursor.execute('SET FOREIGN_KEY_CHECKS=0')
+            cursor.execute('TRUNCATE TABLE `custom_map_edges`')
+            cursor.execute('TRUNCATE TABLE `custom_map_nodes`')
+            cursor.execute('TRUNCATE TABLE `custom_maps`')
+            cursor.execute('SET FOREIGN_KEY_CHECKS=1')
+
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        map_id_map: Dict[str, int] = {}   # stem -> inserted map_id
+
+        for stem in ordered_stems:
+            cfg = cfgs[stem]
+            map_name = map_names[stem]
+            map_id = _insert_one_map(cursor, cfg, map_name, use_icons, menu_group, map_id_map, now)
+            map_id_map[stem] = map_id
+
+        conn.commit()
+        print('Done. Inserted {} map(s).'.format(len(ordered_stems)))
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# DB credential helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_db_conf(args, search_path: str) -> dict:
+    """Read DB credentials from config.php and apply any CLI overrides."""
+    librenms_path = args.librenms_path
+    if librenms_path is None:
+        librenms_path = find_librenms_path(os.path.dirname(os.path.abspath(__file__)))
+        if librenms_path is None:
+            librenms_path = find_librenms_path(os.path.dirname(os.path.abspath(search_path)))
+    if librenms_path is None:
+        print('ERROR: Could not find LibreNMS root (config.php). Use --librenms-path.', file=sys.stderr)
+        sys.exit(1)
+
+    print('Reading DB config from {}/config.php'.format(librenms_path), file=sys.stderr)
+    db_conf = read_librenms_config(librenms_path)
+
+    if args.db_host:
+        db_conf['host'] = args.db_host
+    if args.db_user:
+        db_conf['user'] = args.db_user
+    if args.db_pass:
+        db_conf['password'] = args.db_pass
+    if args.db_name:
+        db_conf['database'] = args.db_name
+
+    if not db_conf.get('host'):
+        db_conf['host'] = 'localhost'
+
+    return db_conf
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    # Brief usage when invoked with no arguments
+    if len(sys.argv) == 1:
+        print('Usage: weathermap_to_custom_map.py <config.conf | configs_dir> [options]')
+        print('       weathermap_to_custom_map.py --help   for full documentation')
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
-        description='Convert a PHP Weathermap .conf file to a LibreNMS Custom Map.',
+        description='Convert PHP Weathermap .conf file(s) to LibreNMS Custom Maps.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(__doc__),
     )
-    parser.add_argument('conf_file', help='Path to Weathermap .conf file')
+    parser.add_argument(
+        'path', nargs='?',
+        help='Path to a single Weathermap .conf file, or a directory of .conf files (batch mode)',
+    )
     parser.add_argument(
         '--output', choices=['sql', 'direct', 'both'], default='sql',
         help='Output mode: sql (default), direct (DB insert), both',
     )
     parser.add_argument('--sql-file', default=None, help='Write SQL to this file (default: stdout)')
-    parser.add_argument('--librenms-path', default=None, help='LibreNMS root directory (contains config.php)')
+    parser.add_argument('--force', action='store_true',
+                        help='Batch mode: TRUNCATE custom map tables before inserting')
+    parser.add_argument('--librenms-path', default=None,
+                        help='LibreNMS root directory (contains config.php)')
     parser.add_argument('--db-host', default=None)
     parser.add_argument('--db-user', default=None)
     parser.add_argument('--db-pass', default=None)
     parser.add_argument('--db-name', default=None)
-    parser.add_argument('--map-name', default=None, help='Override map name')
-    parser.add_argument('--menu-group', default=None, help='Map menu group')
+    parser.add_argument('--map-name', default=None,
+                        help='Override map name (single-map mode only)')
+    parser.add_argument('--menu-group', default=None,
+                        help='Assign maps to this menu group')
     parser.add_argument('--no-icons', action='store_true',
                         help='Use plain box nodes instead of device image icons')
     args = parser.parse_args()
 
+    if args.path is None:
+        parser.print_usage()
+        sys.exit(1)
+
     use_icons = not args.no_icons
 
-    cfg = parse_weathermap_conf(args.conf_file)
-    map_name = args.map_name or cfg.title
-
-    print('Parsed {} nodes, {} links from {}'.format(
-        len(cfg.nodes), len(cfg.links), args.conf_file), file=sys.stderr)
-    print('  Legend position: ({}, {})'.format(cfg.keypos_x, cfg.keypos_y), file=sys.stderr)
-    print('  Default link width: {}'.format(cfg.default_link_width), file=sys.stderr)
-    for node in cfg.nodes.values():
-        style, image = node_style_and_image(node, use_icons)
-        print('  Node {!r}: device_id={}, pos=({},{}), style={!r}, image={!r}'.format(
-            node.name, node.device_id, node.x_pos, node.y_pos, style, image), file=sys.stderr)
-    for link in cfg.links:
-        print('  Link {!r}: {} -> {}, port_id={}, width={}'.format(
-            link.name, link.node1, link.node2, link.port_id,
-            link.width or cfg.default_link_width), file=sys.stderr)
-
-    if args.output in ('sql', 'both'):
-        sql = generate_sql(cfg, map_name, use_icons=use_icons, menu_group=args.menu_group)
-        if args.sql_file:
-            with open(args.sql_file, 'w') as f:
-                f.write(sql)
-            print('SQL written to {}'.format(args.sql_file), file=sys.stderr)
-        else:
-            print(sql)
-
-    if args.output in ('direct', 'both'):
-        librenms_path = args.librenms_path
-        if librenms_path is None:
-            librenms_path = find_librenms_path(os.path.dirname(os.path.abspath(__file__)))
-            if librenms_path is None:
-                librenms_path = find_librenms_path(os.path.dirname(os.path.abspath(args.conf_file)))
-        if librenms_path is None:
-            print('ERROR: Could not find LibreNMS root (config.php). Use --librenms-path.', file=sys.stderr)
+    # -----------------------------------------------------------------------
+    # Batch mode: directory of .conf files
+    # -----------------------------------------------------------------------
+    if os.path.isdir(args.path):
+        configs_dir = args.path
+        stems = discover_configs(configs_dir)
+        if not stems:
+            print('ERROR: No .conf files found in {}'.format(configs_dir), file=sys.stderr)
             sys.exit(1)
 
-        print('Reading DB config from {}/config.php'.format(librenms_path), file=sys.stderr)
-        db_conf = read_librenms_config(librenms_path)
+        print('Found {} .conf file(s) in {}'.format(len(stems), configs_dir), file=sys.stderr)
 
-        if args.db_host:
-            db_conf['host'] = args.db_host
-        if args.db_user:
-            db_conf['user'] = args.db_user
-        if args.db_pass:
-            db_conf['password'] = args.db_pass
-        if args.db_name:
-            db_conf['database'] = args.db_name
+        # Parse all configs
+        cfgs: Dict[str, WMConfig] = {}
+        map_names: Dict[str, str] = {}
+        for stem in stems:
+            path = os.path.join(configs_dir, stem + '.conf')
+            try:
+                cfg = parse_weathermap_conf(path)
+            except Exception as e:
+                print('ERROR parsing {}: {}'.format(path, e), file=sys.stderr)
+                sys.exit(1)
+            cfgs[stem] = cfg
+            map_names[stem] = cfg.title
+            print('  Parsed {!r}: {} node(s), {} link(s)'.format(
+                stem, len(cfg.nodes), len(cfg.links)), file=sys.stderr)
 
-        if not db_conf.get('host'):
-            db_conf['host'] = 'localhost'
+        # Resolve cross-map node links via INFOURL
+        resolve_map_links(cfgs)
+        linked_count = sum(
+            1 for cfg in cfgs.values()
+            for node in cfg.nodes.values()
+            if node.linked_map_name
+        )
+        if linked_count:
+            print('{} cross-map node link(s) resolved.'.format(linked_count), file=sys.stderr)
 
-        insert_direct(cfg, map_name, db_conf, use_icons=use_icons, menu_group=args.menu_group)
+        # Topological sort (dependencies first)
+        graph = build_dependency_graph(cfgs)
+        try:
+            ordered_stems = topological_sort(graph)
+        except ValueError as e:
+            print('ERROR: {}'.format(e), file=sys.stderr)
+            sys.exit(1)
+
+        print('Insertion order: {}'.format(' -> '.join(ordered_stems)), file=sys.stderr)
+
+        if args.output in ('sql', 'both'):
+            sql = batch_generate_sql(
+                ordered_stems, cfgs, map_names,
+                use_icons=use_icons,
+                menu_group=args.menu_group,
+                force=args.force,
+            )
+            if args.sql_file:
+                with open(args.sql_file, 'w') as f:
+                    f.write(sql)
+                print('SQL written to {}'.format(args.sql_file), file=sys.stderr)
+            else:
+                print(sql)
+
+        if args.output in ('direct', 'both'):
+            db_conf = _resolve_db_conf(args, configs_dir)
+            batch_insert_direct(
+                ordered_stems, cfgs, map_names, db_conf,
+                use_icons=use_icons,
+                menu_group=args.menu_group,
+                force=args.force,
+            )
+
+    # -----------------------------------------------------------------------
+    # Single-map mode: one .conf file
+    # -----------------------------------------------------------------------
+    elif os.path.isfile(args.path):
+        conf_file = args.path
+
+        if args.force:
+            print('WARNING: --force is only meaningful in batch (directory) mode; ignored.', file=sys.stderr)
+
+        cfg = parse_weathermap_conf(conf_file)
+        map_name = args.map_name or cfg.title
+
+        print('Parsed {} node(s), {} link(s) from {}'.format(
+            len(cfg.nodes), len(cfg.links), conf_file), file=sys.stderr)
+        print('  Legend position: ({}, {})'.format(cfg.keypos_x, cfg.keypos_y), file=sys.stderr)
+        print('  Default link width: {}'.format(cfg.default_link_width), file=sys.stderr)
+        for node in cfg.nodes.values():
+            style, image = node_style_and_image(node, use_icons)
+            print('  Node {!r}: device_id={}, pos=({},{}), style={!r}, image={!r}, infourl={!r}'.format(
+                node.name, node.device_id, node.x_pos, node.y_pos, style, image, node.infourl),
+                file=sys.stderr)
+        for link in cfg.links:
+            print('  Link {!r}: {} -> {}, port_id={}, width={}'.format(
+                link.name, link.node1, link.node2, link.port_id,
+                link.width or cfg.default_link_width), file=sys.stderr)
+
+        if args.output in ('sql', 'both'):
+            sql = generate_sql(cfg, map_name, use_icons=use_icons, menu_group=args.menu_group)
+            if args.sql_file:
+                with open(args.sql_file, 'w') as f:
+                    f.write(sql)
+                print('SQL written to {}'.format(args.sql_file), file=sys.stderr)
+            else:
+                print(sql)
+
+        if args.output in ('direct', 'both'):
+            db_conf = _resolve_db_conf(args, conf_file)
+            insert_direct(cfg, map_name, db_conf, use_icons=use_icons, menu_group=args.menu_group)
+
+    else:
+        print('ERROR: {} is not a file or directory'.format(args.path), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
