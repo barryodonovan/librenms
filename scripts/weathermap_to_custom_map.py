@@ -361,13 +361,15 @@ def node_colours(style: str) -> tuple:
     return '#D2E5FF', '#2B7CE9'       # LibreNMS default light blue
 
 
-def node_label_bg_colour(style: str) -> Optional[str]:
-    """Return label_bg_colour for a node style, or None for box nodes."""
-    if style == 'circularImage':
-        return '#FFFFCC'   # match node bg — yellow label on map/external nodes
-    if style == 'image':
-        return '#D2E5FF'   # match node bg — light blue label on device nodes
-    return None            # box/other: no label background needed
+def node_label_stroke_colour(style: str) -> Optional[str]:
+    """Return label_stroke_colour (text halo) for a node style, or None for box nodes.
+
+    A white stroke around the label text makes it legible on any canvas colour.
+    Box/text nodes have their own shape background, so no stroke is needed.
+    """
+    if style in ('image', 'circularImage'):
+        return '#FFFFFF'   # white halo — readable on any map background
+    return None            # box/other: label is inside node shape, no halo needed
 
 
 # ---------------------------------------------------------------------------
@@ -504,13 +506,13 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
         label = (node.label or node.name)[:50]
         style, image = node_style_and_image(node, use_icons)
 
-        lbg = node_label_bg_colour(style)
+        lhighlight = node_label_stroke_colour(style)
         lines += [
             '-- Node: {}'.format(node.name),
             'INSERT INTO `custom_map_nodes` (',
             '  `custom_map_id`, `device_id`, `label`, `style`, `icon`, `image`,',
             '  `size`, `border_width`, `text_face`, `text_size`, `text_colour`,',
-            '  `label_bg_colour`, `label_offset_y`,',
+            '  `label_stroke_colour`, `label_offset_y`,',
             '  `colour_bg`, `colour_bdr`, `x_pos`, `y_pos`,',
             '  `created_at`, `updated_at`',
             ') VALUES (',
@@ -525,7 +527,7 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
                 face=sql_escape('arial'),
                 tc=sql_escape('#343434'),
             ),
-            '  {lbg}, NULL,'.format(lbg=sql_escape(lbg) if lbg else 'NULL'),
+            '  {lhighlight}, NULL,'.format(lhighlight=sql_escape(lhighlight) if lhighlight else 'NULL'),
             '  {bg}, {bdr}, {x}, {y},'.format(
                 bg=sql_escape(node_colours(style)[0]),
                 bdr=sql_escape(node_colours(style)[1]),
@@ -724,7 +726,7 @@ def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
                 """INSERT INTO `custom_map_nodes`
                    (`custom_map_id`, `device_id`, `label`, `style`, `icon`, `image`,
                     `size`, `border_width`, `text_face`, `text_size`, `text_colour`,
-                    `label_bg_colour`, `label_offset_y`,
+                    `label_stroke_colour`, `label_offset_y`,
                     `colour_bg`, `colour_bdr`, `x_pos`, `y_pos`,
                     `created_at`, `updated_at`)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -736,7 +738,7 @@ def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
                     None,
                     image or '',
                     node_size(style), 1, 'arial', 14, '#343434',
-                    node_label_bg_colour(style), None,
+                    node_label_stroke_colour(style), None,
                     node_colours(style)[0], node_colours(style)[1],
                     node.x_pos, node.y_pos,
                     now, now,

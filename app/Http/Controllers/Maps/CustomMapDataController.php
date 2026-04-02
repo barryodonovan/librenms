@@ -70,6 +70,7 @@ class CustomMapDataController extends Controller
                 'text_face' => $edge->text_face,
                 'text_size' => $edge->text_size,
                 'text_colour' => $edge->text_colour,
+                'label_stroke_colour' => $edge->label_stroke_colour,
                 'text_align' => $edge->text_align,
                 'mid_x' => $edge->mid_x,
                 'mid_y' => $edge->mid_y,
@@ -155,7 +156,7 @@ class CustomMapDataController extends Controller
                 'text_face' => $node->text_face,
                 'text_size' => $node->text_size,
                 'text_colour' => $node->text_colour,
-                'label_bg_colour' => $node->label_bg_colour,
+                'label_stroke_colour' => $node->label_stroke_colour,
                 'label_offset_y' => $node->label_offset_y,
                 'colour_bg' => $node->colour_bg,
                 'colour_bdr' => $node->colour_bdr,
@@ -256,7 +257,7 @@ class CustomMapDataController extends Controller
                 $dbnode->text_face = $node['font']['face'];
                 $dbnode->text_size = $node['font']['size'];
                 $dbnode->text_colour = $node['font']['color'];
-                $dbnode->label_bg_colour = $node['label_bg_colour'] ?: null;
+                $dbnode->label_stroke_colour = $node['label_stroke_colour'] ?: null;
                 $dbnode->label_offset_y = isset($node['font']['vadjust']) ? intval($node['font']['vadjust']) : null;
                 $dbnode->colour_bg = $node['color']['background'] ?? null;
                 $dbnode->colour_bdr = $node['color']['border'] ?? null;
@@ -291,6 +292,7 @@ class CustomMapDataController extends Controller
                 $dbedge->text_face = $edge['text_face'];
                 $dbedge->text_size = $edge['text_size'];
                 $dbedge->text_colour = $edge['text_colour'];
+                $dbedge->label_stroke_colour = $edge['label_stroke_colour'] ?: null;
                 $dbedge->text_align = $edge['text_align'];
                 $dbedge->mid_x = intval($edge['mid_x']);
                 $dbedge->mid_y = intval($edge['mid_y']);

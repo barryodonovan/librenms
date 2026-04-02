@@ -145,10 +145,9 @@
             } else {
                 node_cfg.image = undefined;
             }
-            if (node.label_bg_colour) {
-                node_cfg.font.background = node.label_bg_colour;
-            } else if(! ["ellipse", "circle", "database", "box", "text"].includes(node_cfg.shape)) {
-                node_cfg.font.background = "#FFFFFF";
+            if (node.label_stroke_colour) {
+                node_cfg.font.strokeWidth = 3;
+                node_cfg.font.strokeColor = node.label_stroke_colour;
             }
             if (node.label_offset_y != null) {
                 node_cfg.font.vadjust = node.label_offset_y;
@@ -211,7 +210,12 @@
             var mid_x =  edge.mid_x;
             var mid_y =  edge.mid_y;
 
-            return {id: edgeid + "_mid", shape: "dot", size: 0, x: mid_x, y: mid_y, label: screenshot ? '' : edge.label, font: {face: edge.text_face, size:  edge.text_size, color: edge.text_colour}};
+            var mid_font = {face: edge.text_face, size: edge.text_size, color: edge.text_colour};
+            if (edge.label_stroke_colour) {
+                mid_font.strokeWidth = 3;
+                mid_font.strokeColor = edge.label_stroke_colour;
+            }
+            return {id: edgeid + "_mid", shape: "dot", size: 0, x: mid_x, y: mid_y, label: screenshot ? '' : edge.label, font: mid_font};
         },
     }
 </script>

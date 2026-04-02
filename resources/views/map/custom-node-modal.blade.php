@@ -153,22 +153,22 @@
                                 </div>
                             </div>
                             <div class="form-group row">
-                                <label for="nodelabelbg" class="col-sm-3 control-label">{{ __('map.custom.edit.node.label_bg_color') }}</label>
+                                <label for="nodelabelhighlight" class="col-sm-3 control-label">{{ __('map.custom.edit.node.label_highlight_color') }}</label>
                                 <div class="col-sm-2">
-                                    <input type=color id="nodelabelbg" class="form-control input-sm" value="#ffffff" />
+                                    <input type=color id="nodelabelhighlight" class="form-control input-sm" value="#ffffff" />
                                 </div>
                                 <div class="col-sm-5">
                                 </div>
                                 <div class="col-sm-2">
-                                    <button type=button class="btn btn-default btn-sm" id="nodelabelbg-reset" onclick="$('#nodelabelbg').data('active', false); $(this).attr('disabled','disabled');">{{ __('None') }}</button>
+                                    <button type=button class="btn btn-default btn-sm" id="nodelabelhighlight-reset" onclick="$('#nodelabelhighlight').data('active', false); $(this).attr('disabled','disabled');">{{ __('map.custom.edit.node.label_highlight_none') }}</button>
                                 </div>
                             </div>
                             <div class="form-group row">
                                 <label for="nodelabeloffset" class="col-sm-3 control-label">{{ __('map.custom.edit.node.label_position') }}</label>
                                 <div class="col-sm-5">
                                     <select id="nodelabeloffset" class="form-control input-sm" onchange="nodeLabelOffsetChange();">
-                                        <option value="">{{ __('map.custom.edit.node.label_position_below') }}</option>
-                                        <option value="above">{{ __('map.custom.edit.node.label_position_above') }}</option>
+                                        <option value="">{{ __('map.custom.edit.node.label_position_bottom') }}</option>
+                                        <option value="top">{{ __('map.custom.edit.node.label_position_top') }}</option>
                                         <option value="custom">{{ __('map.custom.edit.node.label_position_custom') }}</option>
                                     </select>
                                 </div>
@@ -321,17 +321,17 @@
         } else {
             node.icon = {};
         }
-        var lbg = $("#nodelabelbg").data('active') ? $("#nodelabelbg").val() : null;
-        node.label_bg_colour = lbg || null;
-        if (lbg) {
-            node.font.background = lbg;
-        } else if(! ["ellipse", "circle", "database", "box", "text"].includes(node.shape)) {
-            node.font.background = "#FFFFFF";
+        var lhighlight = $("#nodelabelhighlight").data('active') ? $("#nodelabelhighlight").val() : null;
+        node.label_stroke_colour = lhighlight || null;
+        if (lhighlight) {
+            node.font.strokeWidth = 3;
+            node.font.strokeColor = lhighlight;
         } else {
-            delete node.font.background;
+            node.font.strokeWidth = 0;
+            delete node.font.strokeColor;
         }
         var offsetSel = $("#nodelabeloffset").val();
-        if (offsetSel === 'above') {
+        if (offsetSel === 'top') {
             node.font.vadjust = -(parseInt(node.size || 25) * 2 + parseInt(node.font.size || 14) + 10);
         } else if (offsetSel === 'custom') {
             node.font.vadjust = parseInt($("#nodelabeloffset-val").val()) || 0;
@@ -442,23 +442,23 @@
         nodeCheckColourReset(nodeconf.color.background, newnodeconf.color.background, "nodecolourbgreset");
         nodeCheckColourReset(nodeconf.color.border, newnodeconf.color.border, "nodecolourbdrreset");
 
-        // Label background colour
-        if (nodeconf.label_bg_colour) {
-            $("#nodelabelbg").val(nodeconf.label_bg_colour).data('active', true);
-            $("#nodelabelbg-reset").removeAttr('disabled');
+        // Label highlight (stroke)
+        if (nodeconf.label_stroke_colour) {
+            $("#nodelabelhighlight").val(nodeconf.label_stroke_colour).data('active', true);
+            $("#nodelabelhighlight-reset").removeAttr('disabled');
         } else {
-            $("#nodelabelbg").val('#ffffff').data('active', false);
-            $("#nodelabelbg-reset").attr('disabled', 'disabled');
+            $("#nodelabelhighlight").val('#ffffff').data('active', false);
+            $("#nodelabelhighlight-reset").attr('disabled', 'disabled');
         }
-        $("#nodelabelbg").off('change').on('change', function() {
+        $("#nodelabelhighlight").off('change').on('change', function() {
             $(this).data('active', true);
-            $("#nodelabelbg-reset").removeAttr('disabled');
+            $("#nodelabelhighlight-reset").removeAttr('disabled');
         });
 
         // Label vertical offset
         var loy = nodeconf.label_offset_y || 0;
         if (loy < 0) {
-            $("#nodelabeloffset").val('above');
+            $("#nodelabeloffset").val('top');
             $("#nodelabeloffset-custom").hide();
         } else if (loy > 0) {
             $("#nodelabeloffset").val('custom');

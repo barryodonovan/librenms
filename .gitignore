@@ -48,3 +48,6 @@ pyvenv.cfg
 
 /.phpunit.cache/storage/pail
 /.nova
+config.php
+html/pugins/Weathermap
+
