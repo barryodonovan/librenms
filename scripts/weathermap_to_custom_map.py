@@ -604,7 +604,12 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
 
     for node in cfg.nodes.values():
         var_name = _node_var(node.name)
-        device_id_sql = str(node.device_id) if node.device_id is not None else 'NULL'
+        # Use a scalar subquery so an unknown device_id stores NULL rather than
+        # failing the FK constraint (same pattern as port_id on edges).
+        if node.device_id is not None:
+            device_id_sql = '(SELECT `device_id` FROM `devices` WHERE `device_id` = {} LIMIT 1)'.format(node.device_id)
+        else:
+            device_id_sql = 'NULL'
         label = (node.label or node.name)[:50]
         style, image = node_style_and_image(node, use_icons)
 
@@ -851,6 +856,15 @@ def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
         if node.linked_map_name and map_id_map:
             linked_map_id = map_id_map.get(node.linked_map_name)
 
+        # Validate device_id: set to None if it doesn't exist in this DB
+        device_id = node.device_id
+        if device_id is not None:
+            cursor.execute('SELECT `device_id` FROM `devices` WHERE `device_id` = %s LIMIT 1', (device_id,))
+            if cursor.fetchone() is None:
+                print('  WARNING: device_id={} not found in DB for node {!r}, storing NULL'.format(
+                    device_id, node.name), file=sys.stderr)
+                device_id = None
+
         cursor.execute(
             """INSERT INTO `custom_map_nodes`
                    (`custom_map_id`, `device_id`, `linked_custom_map_id`, `label`, `style`, `icon`, `image`,
@@ -861,7 +875,7 @@ def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 map_id,
-                node.device_id,
+                device_id,
                 linked_map_id,
                 label,
                 style,
@@ -876,7 +890,7 @@ def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
         )
         node_ids[node.name] = cursor.lastrowid
         print('  Node {!r} id={} device_id={} style={!r} linked_map_id={}'.format(
-            node.name, node_ids[node.name], node.device_id, style, linked_map_id))
+            node.name, node_ids[node.name], device_id, style, linked_map_id))
 
     for link in cfg.links:
         n1_id = node_ids.get(link.node1)
