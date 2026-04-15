@@ -51,6 +51,19 @@ OPTIONS
   --no-icons
       Use plain labelled box nodes instead of device-icon image nodes.
 
+  --node-label-offset
+      Include the label_offset_y column in node INSERT statements.  This
+      column is used to vertically reposition node labels (e.g. above the
+      node icon) and requires the corresponding schema change to
+      custom_map_nodes (ALTER TABLE ADD COLUMN label_offset_y INT NULL).
+      Omit this flag when importing into a stock upstream LibreNMS instance
+      that does not yet have that column.
+
+      NOTE: once the schema change is accepted upstream, change the default
+      for the node_label_offset parameter in generate_sql() and
+      _insert_one_map() from False to True so that this feature is enabled
+      automatically without needing the flag.
+
 BATCH MODE
   When the positional argument is a directory the script scans it for *.conf
   files, parses them all, detects cross-map links by matching each node's
@@ -542,7 +555,8 @@ def _map_var_for_stem(stem: str) -> str:
 def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
                  menu_group: Optional[str] = None,
                  map_var: str = '@map_id',
-                 all_map_vars: Optional[Dict[str, str]] = None) -> str:
+                 all_map_vars: Optional[Dict[str, str]] = None,
+                 node_label_offset: bool = False) -> str:
     """
     Generate SQL INSERT statements for one map.
 
@@ -625,7 +639,7 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
             'INSERT INTO `custom_map_nodes` (',
             '  `custom_map_id`, `device_id`, `linked_custom_map_id`, `label`, `style`, `icon`, `image`,',
             '  `size`, `border_width`, `text_face`, `text_size`, `text_colour`,',
-            '  `label_stroke_colour`, `label_offset_y`,',
+            '  `label_stroke_colour`{},'.format(', `label_offset_y`' if node_label_offset else ''),
             '  `colour_bg`, `colour_bdr`, `x_pos`, `y_pos`,',
             '  `created_at`, `updated_at`',
             ') VALUES (',
@@ -642,7 +656,10 @@ def generate_sql(cfg: WMConfig, map_name: str, use_icons: bool = True,
                 face=sql_escape('arial'),
                 tc=sql_escape('#343434'),
             ),
-            '  {lhighlight}, NULL,'.format(lhighlight=sql_escape(lhighlight) if lhighlight else 'NULL'),
+            '  {lhighlight}{offset},'.format(
+                lhighlight=sql_escape(lhighlight) if lhighlight else 'NULL',
+                offset=', NULL' if node_label_offset else '',
+            ),
             '  {bg}, {bdr}, {x}, {y},'.format(
                 bg=sql_escape(node_colours(style)[0]),
                 bdr=sql_escape(node_colours(style)[1]),
@@ -806,7 +823,8 @@ def _connect(db_conf: dict):
 def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
                     use_icons: bool = True, menu_group: Optional[str] = None,
                     map_id_map: Optional[Dict[str, int]] = None,
-                    now: Optional[str] = None) -> int:
+                    now: Optional[str] = None,
+                    node_label_offset: bool = False) -> int:
     """
     Insert one map (nodes + edges) using an existing cursor.  Returns map_id.
 
@@ -865,14 +883,23 @@ def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
                     device_id, node.name), file=sys.stderr)
                 device_id = None
 
+        if node_label_offset:
+            col_extra = ', `label_offset_y`'
+            val_extra = ', %s'
+            val_args_extra = (None,)
+        else:
+            col_extra = ''
+            val_extra = ''
+            val_args_extra = ()
         cursor.execute(
             """INSERT INTO `custom_map_nodes`
                    (`custom_map_id`, `device_id`, `linked_custom_map_id`, `label`, `style`, `icon`, `image`,
                     `size`, `border_width`, `text_face`, `text_size`, `text_colour`,
-                    `label_stroke_colour`, `label_offset_y`,
+                    `label_stroke_colour`{col_extra},
                     `colour_bg`, `colour_bdr`, `x_pos`, `y_pos`,
                     `created_at`, `updated_at`)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{val_extra}, %s, %s, %s, %s, %s, %s)""".format(
+                col_extra=col_extra, val_extra=val_extra),
             (
                 map_id,
                 device_id,
@@ -882,7 +909,8 @@ def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
                 None,
                 image or '',
                 node_size(style), 1, 'arial', 14, '#343434',
-                node_label_stroke_colour(style), None,
+                node_label_stroke_colour(style),
+            ) + val_args_extra + (
                 node_colours(style)[0], node_colours(style)[1],
                 node.x_pos, node.y_pos,
                 now, now,
@@ -940,12 +968,14 @@ def _insert_one_map(cursor, cfg: WMConfig, map_name: str,
 
 def insert_direct(cfg: WMConfig, map_name: str, db_conf: dict,
                   use_icons: bool = True, menu_group: Optional[str] = None,
-                  map_id_map: Optional[Dict[str, int]] = None) -> int:
+                  map_id_map: Optional[Dict[str, int]] = None,
+                  node_label_offset: bool = False) -> int:
     """Insert a single map into the DB. Returns the new map_id."""
     conn = _connect(db_conf)
     cursor = conn.cursor()
     try:
-        map_id = _insert_one_map(cursor, cfg, map_name, use_icons, menu_group, map_id_map)
+        map_id = _insert_one_map(cursor, cfg, map_name, use_icons, menu_group, map_id_map,
+                                 node_label_offset=node_label_offset)
         conn.commit()
         print('Done.')
         return map_id
@@ -1120,7 +1150,8 @@ _TRUNCATE_SQL = textwrap.dedent("""\
 def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
                        map_names: Dict[str, str], use_icons: bool = True,
                        menu_group: Optional[str] = None,
-                       reset_table_ids: bool = False) -> str:
+                       reset_table_ids: bool = False,
+                       node_label_offset: bool = False) -> str:
     """
     Generate a single SQL script that inserts all maps in dependency order.
     Each map gets a unique SQL user variable for its ID so that later maps can
@@ -1142,6 +1173,7 @@ def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
             menu_group=menu_group,
             map_var=all_map_vars[stem],
             all_map_vars=all_map_vars,
+            node_label_offset=node_label_offset,
         )
         parts.append(sql)
 
@@ -1155,7 +1187,8 @@ def batch_generate_sql(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
 def batch_insert_direct(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
                         map_names: Dict[str, str], db_conf: dict,
                         use_icons: bool = True, menu_group: Optional[str] = None,
-                        reset_table_ids: bool = False) -> None:
+                        reset_table_ids: bool = False,
+                        node_label_offset: bool = False) -> None:
     """Insert all maps in dependency order using a single DB connection."""
     conn = _connect(db_conf)
     cursor = conn.cursor()
@@ -1174,7 +1207,8 @@ def batch_insert_direct(ordered_stems: List[str], cfgs: Dict[str, WMConfig],
         for stem in ordered_stems:
             cfg = cfgs[stem]
             map_name = map_names[stem]
-            map_id = _insert_one_map(cursor, cfg, map_name, use_icons, menu_group, map_id_map, now)
+            map_id = _insert_one_map(cursor, cfg, map_name, use_icons, menu_group, map_id_map, now,
+                                     node_label_offset=node_label_offset)
             map_id_map[stem] = map_id
 
         conn.commit()
@@ -1263,6 +1297,8 @@ def main():
                         help='Assign maps to this menu group')
     parser.add_argument('--no-icons', action='store_true',
                         help='Use plain box nodes instead of device image icons')
+    parser.add_argument('--node-label-offset', action='store_true',
+                        help='Include label_offset_y column in node INSERTs (requires the upstream schema change)')
     args = parser.parse_args()
 
     if args.path is None:
@@ -1270,6 +1306,7 @@ def main():
         sys.exit(1)
 
     use_icons = not args.no_icons
+    node_label_offset = args.node_label_offset
 
     # -----------------------------------------------------------------------
     # Batch mode: directory of .conf files
@@ -1353,6 +1390,7 @@ def main():
                 use_icons=use_icons,
                 menu_group=args.menu_group,
                 reset_table_ids=reset_table_ids,
+                node_label_offset=node_label_offset,
             )
             if args.sql_file:
                 with open(args.sql_file, 'w') as f:
@@ -1368,6 +1406,7 @@ def main():
                 use_icons=use_icons,
                 menu_group=args.menu_group,
                 reset_table_ids=reset_table_ids,
+                node_label_offset=node_label_offset,
             )
 
     # -----------------------------------------------------------------------
@@ -1397,7 +1436,8 @@ def main():
                 link.width or cfg.default_link_width), file=sys.stderr)
 
         if args.output in ('sql', 'both'):
-            sql = generate_sql(cfg, map_name, use_icons=use_icons, menu_group=args.menu_group)
+            sql = generate_sql(cfg, map_name, use_icons=use_icons, menu_group=args.menu_group,
+                               node_label_offset=node_label_offset)
             if args.sql_file:
                 with open(args.sql_file, 'w') as f:
                     f.write(sql)
@@ -1407,7 +1447,8 @@ def main():
 
         if args.output in ('direct', 'both'):
             db_conf = _resolve_db_conf(args, conf_file)
-            insert_direct(cfg, map_name, db_conf, use_icons=use_icons, menu_group=args.menu_group)
+            insert_direct(cfg, map_name, db_conf, use_icons=use_icons, menu_group=args.menu_group,
+                          node_label_offset=node_label_offset)
 
     else:
         print('ERROR: {} is not a file or directory'.format(args.path), file=sys.stderr)
